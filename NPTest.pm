@@ -422,6 +422,7 @@ sub LoadCache
 {
   return if exists( $CACHE{'_cache_loaded_'} );
 
+  my $fileContents = "";
   if ( -f $CACHEFILENAME )
   {
     my( $fileHandle ) = new IO::File;
@@ -432,40 +433,45 @@ sub LoadCache
       return;
     }
 
-    my( $fileContents ) = join( "\n", <$fileHandle> );
-
+    $fileContents = join("", <$fileHandle>);
     $fileHandle->close();
 
+    chomp($fileContents);
     my( $contentsRef ) = eval $fileContents;
     %CACHE = %{$contentsRef};
 
   }
 
-  $CACHE{'_cache_loaded_'} = 1;
+  $CACHE{'_cache_loaded_'}  = 1;
+  $CACHE{'_original_cache'} = $fileContents;
 }
 
 
 sub SaveCache
 {
   delete $CACHE{'_cache_loaded_'};
+  my $oldFileContents = delete $CACHE{'_original_cache'};
 
-  my( $fileHandle ) = new IO::File;
+  my($dataDumper) = new Data::Dumper([\%CACHE]);
+  $dataDumper->Terse(1);
+  $dataDumper->Sortkeys(1);
+  my $data = $dataDumper->Dump();
+  $data =~ s/^\s+/  /gmx; # make sure all systems use same amount of whitespace
+  $data =~ s/^\s+}/}/gmx;
+  chomp($data);
 
-  if ( ! $fileHandle->open( "> ${CACHEFILENAME}" ) )
-  {
-    print STDERR "NPTest::LoadCache() : Problem saving ${CACHEFILENAME} : $!\n";
-    return;
+  if($oldFileContents ne $data) {
+    my($fileHandle) = new IO::File;
+    if (!$fileHandle->open( "> ${CACHEFILENAME}")) {
+      print STDERR "NPTest::LoadCache() : Problem saving ${CACHEFILENAME} : $!\n";
+      return;
+    }
+    print $fileHandle $data;
+    $fileHandle->close();
   }
 
-  my( $dataDumper ) = new Data::Dumper( [ \%CACHE ] );
-
-  $dataDumper->Terse(1);
-
-  print $fileHandle $dataDumper->Dump();
-
-  $fileHandle->close();
-
-  $CACHE{'_cache_loaded_'} = 1;
+  $CACHE{'_cache_loaded_'}  = 1;
+  $CACHE{'_original_cache'} = $data;
 }
 
 #
@@ -555,12 +561,12 @@ sub TestsFrom
     {
       if ( $excludeIfAppMissing )
       {
-	$application = basename( $filename, ".t" );
-	if ( ! -e $application )
-	{
-	  print STDERR "No application (${application}) found for test harness (${filename})\n";
-	  next;
-	}
+        $application = basename( $filename, ".t" );
+        if ( ! -e $application and ! -e $application.'.pm' )
+        {
+          print STDERR "No application (${application}) found for test harness (${filename})\n";
+          next;
+        }
       }
       push @tests, "${directory}/${filename}";
     }
@@ -615,7 +621,10 @@ sub testCmd {
 	my $class = shift;
 	my $command = shift or die "No command passed to testCmd";
 	my $object = $class->new;
-	
+
+	local $SIG{'ALRM'} = sub { die("timeout in command: $command"); };
+	alarm(120); # no test should take longer than 120 seconds
+
 	my $output = `$command`;
 	$object->return_code($? >> 8);
 	$_ = $? & 127;
@@ -624,6 +633,8 @@ sub testCmd {
 	}
 	chomp $output;
 	$object->output($output);
+
+	alarm(0);
 
 	my ($pkg, $file, $line) = caller(0);
 	print "Testing: $command", $/;
@@ -634,6 +645,16 @@ sub testCmd {
 	}
 
 	return $object;
+}
+
+# do we have ipv6
+sub has_ipv6 {
+    # assume ipv6 if a ping6 to labs.consol.de works
+    `ping6 -c 1 2a03:3680:0:2::21 2>&1`;
+    if($? == 0) {
+        return 1;
+    }
+    return;
 }
 
 1;

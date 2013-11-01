@@ -42,6 +42,11 @@ const char *email = "nagiosplug-devel@lists.sourceforge.net";
 #include "regex.h"
 
 #include <pwd.h>
+#include <errno.h>
+
+#ifdef HAVE_SYS_STAT_H
+#include <sys/stat.h>
+#endif
 
 int process_arguments (int, char **);
 int validate_arguments (void);
@@ -65,6 +70,10 @@ int options = 0; /* bitmask of filter criteria to test against */
 #define PCPU 256
 #define ELAPSED 512
 #define EREG_ARGS 1024
+
+#define KTHREAD_PARENT "kthreadd" /* the parent process of kernel threads:
+							ppid of procs are compared to pid of this proc*/
+
 /* Different metrics */
 char *metric_name;
 enum metric {
@@ -90,8 +99,20 @@ regex_t re_args;
 char *fmt;
 char *fails;
 char tmp[MAX_INPUT_BUFFER];
+int kthread_filter = 0;
+int usepid = 0; /* whether to test for pid or /proc/pid/exe */
 
 FILE *ps_input = NULL;
+
+static int
+stat_exe (const pid_t pid, struct stat *buf) {
+	char *path;
+	int ret;
+	xasprintf(&path, "/proc/%d/exe", pid);
+	ret = stat(path, buf);
+	free(path);
+	return ret;
+}
 
 
 int
@@ -102,9 +123,13 @@ main (int argc, char **argv)
 	char *procprog;
 
 	pid_t mypid = 0;
+	struct stat statbuf;
+	dev_t mydev = 0;
+	ino_t myino = 0;
 	int procuid = 0;
 	pid_t procpid = 0;
 	pid_t procppid = 0;
+	pid_t kthread_ppid = 0;
 	int procvsz = 0;
 	int procrss = 0;
 	int procseconds = 0;
@@ -125,6 +150,7 @@ main (int argc, char **argv)
 	int crit = 0; /* number of processes in crit state */
 	int i = 0, j = 0;
 	int result = STATE_UNKNOWN;
+	int ret = 0;
 	output chld_out, chld_err;
 
 	setlocale (LC_ALL, "");
@@ -144,8 +170,16 @@ main (int argc, char **argv)
 	if (process_arguments (argc, argv) == ERROR)
 		usage4 (_("Could not parse arguments"));
 
-	/* get our pid */
+	/* find ourself */
 	mypid = getpid();
+	if (usepid || stat_exe(mypid, &statbuf) == -1) {
+		/* usepid might have been set by -T */
+		usepid = 1;
+	} else {
+		usepid = 0;
+		mydev = statbuf.st_dev;
+		myino = statbuf.st_ino;
+	}
 
 	/* Set signal handling and alarm timeout */
 	if (signal (SIGALRM, timeout_alarm_handler) == SIG_ERR) {
@@ -200,7 +234,28 @@ main (int argc, char **argv)
 					procetime, procprog, procargs);
 
 			/* Ignore self */
-			if (mypid == procpid) continue;
+			if ((usepid && mypid == procpid) ||
+				(!usepid && ((ret = stat_exe(procpid, &statbuf) != -1) && statbuf.st_dev == mydev && statbuf.st_ino == myino) ||
+				 (ret == -1 && errno == ENOENT))) {
+				if (verbose >= 3)
+					 printf("not considering - is myself or gone\n");
+				continue;
+			}
+
+			/* filter kernel threads (childs of KTHREAD_PARENT)*/
+			/* TODO adapt for other OSes than GNU/Linux
+					sorry for not doing that, but I've no other OSes to test :-( */
+			if (kthread_filter == 1) {
+				/* get pid KTHREAD_PARENT */
+				if (kthread_ppid == 0 && !strcmp(procprog, KTHREAD_PARENT) )
+					kthread_ppid = procpid;
+
+				if (kthread_ppid == procppid) {
+					if (verbose >= 2)
+						printf ("Ignore kernel thread: pid=%d ppid=%d prog=%s args=%s\n", procpid, procppid, procprog, procargs);
+					continue;
+				}
+			}
 
 			if ((options & STAT) && (strstr (statopts, procstat)))
 				resultsum |= STAT;
@@ -332,6 +387,7 @@ process_arguments (int argc, char **argv)
 		{"timeout", required_argument, 0, 't'},
 		{"status", required_argument, 0, 's'},
 		{"ppid", required_argument, 0, 'p'},
+		{"user", required_argument, 0, 'u'},
 		{"command", required_argument, 0, 'C'},
 		{"vsz", required_argument, 0, 'z'},
 		{"rss", required_argument, 0, 'r'},
@@ -343,6 +399,8 @@ process_arguments (int argc, char **argv)
 		{"verbose", no_argument, 0, 'v'},
 		{"ereg-argument-array", required_argument, 0, CHAR_MAX+1},
 		{"input-file", required_argument, 0, CHAR_MAX+2},
+		{"no-kthreads", required_argument, 0, 'k'},
+		{"traditional-filter", no_argument, 0, 'T'},
 		{0, 0, 0, 0}
 	};
 
@@ -351,7 +409,7 @@ process_arguments (int argc, char **argv)
 			strcpy (argv[c], "-t");
 
 	while (1) {
-		c = getopt_long (argc, argv, "Vvht:c:w:p:s:u:C:a:z:r:m:P:", 
+		c = getopt_long (argc, argv, "Vvhkt:c:w:p:s:u:C:a:z:r:m:P:T",
 			longopts, &option);
 
 		if (c == -1 || c == EOF)
@@ -495,8 +553,14 @@ process_arguments (int argc, char **argv)
 			}
 				
 			usage4 (_("Metric must be one of PROCS, VSZ, RSS, CPU, ELAPSED!"));
+		case 'k':	/* linux kernel thread filter */
+			kthread_filter = 1;
+			break;
 		case 'v':									/* command */
 			verbose++;
+			break;
+		case 'T':
+			usepid = 1;
 			break;
 		case CHAR_MAX+2:
 			input_filename = optarg;
@@ -648,6 +712,9 @@ print_help (void)
 	printf (" %s\n", "-v, --verbose");
   printf ("    %s\n", _("Extra information. Up to 3 verbosity levels"));
 
+  printf (" %s\n", "-T, --traditional");
+  printf ("   %s\n", _("Filter own process the traditional way by PID instead of /proc/pid/exe"));
+
   printf ("\n");
 	printf ("%s\n", "Filters:");
   printf (" %s\n", "-s, --state=STATUSFLAGS");
@@ -670,6 +737,8 @@ print_help (void)
   printf ("   %s\n", _("Only scan for processes with args that contain the regex STRING."));
   printf (" %s\n", "-C, --command=COMMAND");
   printf ("   %s\n", _("Only scan for exact matches of COMMAND (without path)."));
+  printf (" %s\n", "-k, --no-kthreads");
+  printf ("   %s\n", _("Only scan for non kernel threads (works on Linux only)."));
 
 	printf(_("\n\
 RANGEs are specified 'min:max' or 'min:' or ':max' (or 'max'). If\n\
@@ -704,5 +773,5 @@ print_usage (void)
   printf ("%s\n", _("Usage:"));
 	printf ("%s -w <range> -c <range> [-m metric] [-s state] [-p ppid]\n", progname);
   printf (" [-u user] [-r rss] [-z vsz] [-P %%cpu] [-a argument-array]\n");
-  printf (" [-C command] [-t timeout] [-v]\n");
+  printf (" [-C command] [-k] [-t timeout] [-v]\n");
 }

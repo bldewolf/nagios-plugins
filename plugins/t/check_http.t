@@ -8,34 +8,31 @@ use strict;
 use Test::More;
 use NPTest;
 
-plan tests => 28;
+plan tests => 30;
 
 my $successOutput = '/OK.*HTTP.*second/';
 
 my $res;
 
-my $host_tcp_http      = getTestParameter( "NP_HOST_TCP_HTTP", 
-		"A host providing the HTTP Service (a web server)", 
+my $host_tcp_http      = getTestParameter( "NP_HOST_TCP_HTTP",
+		"A host providing the HTTP Service (a web server)",
 		"localhost" );
 
-my $host_nonresponsive = getTestParameter( "NP_HOST_NONRESPONSIVE", 
+my $host_nonresponsive = getTestParameter( "NP_HOST_NONRESPONSIVE",
 		"The hostname of system not responsive to network requests",
 		"10.0.0.1" );
 
-my $hostname_invalid   = getTestParameter( "NP_HOSTNAME_INVALID", 
-		"An invalid (not known to DNS) hostname",  
+my $hostname_invalid   = getTestParameter( "NP_HOSTNAME_INVALID",
+		"An invalid (not known to DNS) hostname",
 		"nosuchhost");
 
 my $internet_access = getTestParameter( "NP_INTERNET_ACCESS",
                 "Is this system directly connected to the internet?",
                 "yes");
 
-my $host_tcp_http2;
-if ($internet_access eq "no") {
-    $host_tcp_http2     = getTestParameter( "NP_HOST_TCP_HTTP2", 
-            "A host providing an index page containing the string 'nagios'", 
-            "www.nagios.com" );
-}
+my $host_tcp_http2  = getTestParameter( "NP_HOST_TCP_HTTP2",
+            "A host providing an index page containing the string 'nagios'",
+            "nagios.org" );
 
 
 $res = NPTest->testCmd(
@@ -45,14 +42,9 @@ cmp_ok( $res->return_code, '==', 0, "Webserver $host_tcp_http responded" );
 like( $res->output, $successOutput, "Output OK" );
 
 $res = NPTest->testCmd(
-	"./check_http $host_tcp_http -wt 300 -ct 600 -v -v -v -k 'bob:there;fred:here'"
+	"./check_http $host_tcp_http -wt 300 -ct 600 -v -v -v -k 'bob:there' -k 'carl:frown'"
 	);
-like( $res->output, '/bob:there\r\nfred:here\r\n/', "Got headers, delimited with ';'" );
-
-$res = NPTest->testCmd(
-	"./check_http $host_tcp_http -wt 300 -ct 600 -v -v -v -k 'bob:there;fred:here' -k 'carl:frown'"
-	);
-like( $res->output, '/bob:there\r\nfred:here\r\ncarl:frown\r\n/', "Got headers with multiple -k options" );
+like( $res->output, '/bob:there\r\ncarl:frown\r\n/', "Got headers with multiple -k options" );
 
 $res = NPTest->testCmd(
 	"./check_http $host_nonresponsive -wt 1 -ct 2"
@@ -70,10 +62,7 @@ cmp_ok( $res->return_code, '==', 2, "Webserver $hostname_invalid not valid" );
 like( $res->output, "/Unable to open TCP socket|Socket timeout after/", "Output OK");
 
 SKIP: {
-        skip "No internet access and no host serving nagios in index file",
-              7 if $internet_access eq "no" && ! $host_tcp_http2;
-
-        $host_tcp_http2 = "www.nagios.com" if (! $host_tcp_http2);
+        skip "No host serving nagios in index file", 7 unless $host_tcp_http2;
 
         $res = NPTest->testCmd( "./check_http -H $host_tcp_http2 -r 'nagios'" );
         cmp_ok( $res->return_code, "==", 0, "Got a reference to 'nagios'");
@@ -123,6 +112,10 @@ SKIP: {
         $res = NPTest->testCmd( "./check_http www.verisign.com -C 1" );
         cmp_ok( $res->output, 'eq', $saved_cert_output, "Old syntax for cert checking still works");
 
+        $res = NPTest->testCmd( "./check_http --ssl www.verisign.com -E" );
+        like  ( $res->output, '/time_connect=[\d\.]+/', 'Extended Performance Data Output OK' );
+        like  ( $res->output, '/time_ssl=[\d\.]+/', 'Extended Performance Data SSL Output OK' );
+
         $res = NPTest->testCmd(
                 "./check_http --ssl www.e-paycobalt.com"
                 );
@@ -131,4 +124,7 @@ SKIP: {
 
         $res = NPTest->testCmd( "./check_http -H www.mozilla.com -u /firefox -f follow" );
         is( $res->return_code, 0, "Redirection based on location is okay");
+
+        $res = NPTest->testCmd( "./check_http -H www.mozilla.com --extended-perfdata" );
+        like  ( $res->output, '/time_connect=[\d\.]+/', 'Extended Performance Data Output OK' );
 }
